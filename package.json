@@ -1,0 +1,16 @@
+{
+  "name": "pi-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Central hub: Amanda drives `pi` coding agents on remote hosts over outbound WebSocket",
+  "main": "server.js",
+  "scripts": {
+    "hub": "node server.js",
+    "agent": "node agent.js"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^1.5.2",
+    "ws": "^8.23.0"
+  }
+}

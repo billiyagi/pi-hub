@@ -1,0 +1,33 @@
+# pi.billycloud.my.id → pi-hub (127.0.0.1/172.17.0.1:8742).
+# Public by design: remote pi agents (home/office) dial IN over wss://…/agent?token=…
+# so no inbound port or VPN is needed on those machines. /run + /hosts need a bearer token.
+# DNS is DNS-only (grey cloud) because agents hold a long-lived WebSocket.
+pi.billycloud.my.id {
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+
+	encode zstd gzip
+
+	# WebSocket upgrade for the agent tunnel + JSON API.
+	reverse_proxy host.docker.internal:8742 {
+		header_up X-Real-IP {remote_host}
+		# Long-lived agent sockets: do not cut them at Caddy's default idle timeout.
+		transport http {
+			read_timeout 0
+			write_timeout 0
+			dial_timeout 10s
+		}
+	}
+
+	header -Server
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+	}
+	log {
+		output stdout
+		format json
+		level INFO
+	}
+}

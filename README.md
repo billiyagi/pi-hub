@@ -10,12 +10,21 @@ dial **out** (no inbound port, no VPN, no public IP).
 ## Install on a new host
 
 ```bash
+# 1. on the hub: mint a token for that host
+cd ~/pi-hub && node agents.mjs add rumah --root '$HOME'
+
+# 2. on the host: paste the command it prints
 curl -fsSL https://pi.billycloud.my.id/install.sh \
-  | bash -s -- --token <HUB_TOKEN> --key <PI_BILLY_KEY> --name rumah
+  | bash -s -- --token <AGENT_TOKEN> --name rumah
 ```
 
-Both `--token` and `--key` are required. `--key` is the model-provider key; the
-installer bakes it into `~/.pi-hub.env` **and** `~/.pi/agent/models.json`.
+No `--key`: the installer fetches `GET /bootstrap/models.json` with that token and writes it to
+`~/.pi/agent/models.json`, so the provider key never appears in a command line, shell history or
+chat. `$VAR` apiKey placeholders in the hub's own config are resolved server-side before sending.
+Pass `--key` only to override with a different provider key.
+
+`--name` should equal the name you registered — the hub takes the name from the token anyway, so
+a mismatch only confuses logs.
 
 Other flags: `--hub wss://…/agent`, `--model billy/amanda-agent`, `--root <allowed dir>`,
 `--dir <install dir>`. Env passthrough: `PI_API_BASE` (default `https://ai.billycloud.my.id/v1`),
@@ -47,6 +56,9 @@ curl -H "Authorization: Bearer ***" https://pi.billycloud.my.id/hosts
 
 # registry (persisted, online flag)
 curl -H "Authorization: Bearer ***" https://pi.billycloud.my.id/agents
+
+# model config for a new host (auth required: the file holds the provider key)
+curl -H "Authorization: Bearer ***" https://pi.billycloud.my.id/bootstrap/models.json
 
 # run a prompt on one host
 curl -X POST https://pi.billycloud.my.id/run \

@@ -2,7 +2,9 @@
 // the hub forwards it over an already-open outbound WebSocket to the pi agent
 // sitting on Billy's home/office host. No inbound port on those hosts.
 import http from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import path from 'node:path';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 
@@ -12,6 +14,27 @@ const TOKEN = process.env.PI_HUB_TOKEN;
 if (!TOKEN) {
   console.error('PI_HUB_TOKEN is required');
   process.exit(1);
+}
+
+// Per-agent tokens: a token *is* the agent's identity, so a client can never claim another
+// agent's name. Managed with `node agents.mjs add|list|revoke <name>`.
+const STATE = process.env.PI_HUB_STATE || path.join(homedir(), '.pi-hub', 'agents.json');
+
+function registry() {
+  try {
+    return JSON.parse(readFileSync(STATE, 'utf8')).agents || {};
+  } catch {
+    return {};
+  }
+}
+
+function agentByToken(token) {
+  if (!token) return null;
+  for (const [name, a] of Object.entries(registry())) {
+    if (a?.revokedAt) continue;
+    if (safeEq(token, a?.token)) return name;
+  }
+  return null;
 }
 
 /** @type {Map<string, {ws: import('ws').WebSocket, info: any, connectedAt: number}>} */
@@ -124,7 +147,11 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (!safeEq(req.headers.authorization?.replace(/^Bearer\s+/i, ''), TOKEN)) {
-    return json(res, 401, { error: 'unauthorized' });
+    const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+    const pinned = agentByToken(bearer);
+    if (!pinned) return json(res, 401, { error: 'unauthorized' });
+    // An agent's own token may only act as itself.
+    req.pinnedHost = pinned;
   }
 
   try {
@@ -132,9 +159,22 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { hosts: listAgents() });
     }
 
+    if (req.method === 'GET' && url.pathname === '/agents') {
+      const online = new Set(agents.keys());
+      return json(res, 200, {
+        agents: Object.entries(registry()).map(([name, a]) => ({
+          name,
+          online: online.has(name),
+          createdAt: a?.createdAt || null,
+          revokedAt: a?.revokedAt || null,
+          lastSeenAt: a?.lastSeenAt || null,
+        })),
+      });
+    }
+
     if (req.method === 'POST' && url.pathname === '/run') {
       const body = await readBody(req);
-      const host = body.host || 'default';
+      const host = req.pinnedHost || body.host || 'default';
       const message = String(body.message || '').trim();
       if (!message) return json(res, 400, { error: 'message is required' });
       const timeoutMs = Math.min(Number(body.timeoutMs) || 900_000, 3_600_000);
@@ -150,9 +190,23 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, result);
     }
 
+    if (req.method === 'POST' && url.pathname === '/exec') {
+      const body = await readBody(req);
+      const command = String(body.command || '').trim();
+      if (!command) return json(res, 400, { error: 'command is required' });
+      const host = req.pinnedHost || body.host || 'default';
+      const timeoutMs = Math.min(Number(body.timeoutMs) || 120_000, 1_800_000);
+      const result = await dispatch(
+        host,
+        { type: 'exec', command, cwd: body.cwd || undefined, timeoutMs },
+        timeoutMs + 15_000,
+      );
+      return json(res, 200, result);
+    }
+
     if (req.method === 'POST' && url.pathname === '/cancel') {
       const body = await readBody(req);
-      const a = agents.get(body.host || 'default');
+      const a = agents.get(req.pinnedHost || body.host || 'default');
       if (!a) return json(res, 404, { error: 'host not connected' });
       a.ws.send(JSON.stringify({ type: 'cancel', id: body.id }));
       return json(res, 200, { ok: true });
@@ -169,11 +223,13 @@ const wss = new WebSocketServer({ server, path: '/agent' });
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, 'http://localhost');
   const token = url.searchParams.get('token') || req.headers['x-pi-token'];
-  if (!safeEq(token, TOKEN)) {
+  const isMaster = safeEq(token, TOKEN);
+  const pinnedName = isMaster ? null : agentByToken(token);
+  if (!isMaster && !pinnedName) {
     ws.close(4401, 'unauthorized');
     return;
   }
-  let name = url.searchParams.get('name') || 'default';
+  let name = pinnedName || url.searchParams.get('name') || 'default';
 
   ws.on('message', (raw) => {
     let msg;
@@ -183,7 +239,7 @@ wss.on('connection', (ws, req) => {
       return;
     }
     if (msg.type === 'hello') {
-      name = msg.name || name;
+      name = pinnedName || msg.name || name;
       agents.set(name, { ws, info: msg.info || {}, connectedAt: Date.now() });
       console.log(`[hub] agent online: ${name} ${JSON.stringify(msg.info || {})}`);
       ws.send(JSON.stringify({ type: 'hello-ok', name }));
@@ -218,6 +274,18 @@ wss.on('connection', (ws, req) => {
 });
 
 server.listen(PORT, HOST, () => console.log(`[hub] listening on ${HOST}:${PORT}`));
+
+// A revoked token must stop working now, not on the agent's next reconnect.
+setInterval(() => {
+  const reg = registry();
+  for (const [name, a] of agents) {
+    if (reg[name]?.revokedAt) {
+      a.ws.close(4401, 'revoked');
+      agents.delete(name);
+      console.log(`[hub] agent revoked and dropped: ${name}`);
+    }
+  }
+}, 30_000).unref();
 
 for (const sig of ['SIGTERM', 'SIGINT']) {
   process.on(sig, () => {

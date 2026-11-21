@@ -21,22 +21,50 @@ Other flags: `--hub wss://…/agent`, `--model billy/amanda-agent`, `--root <all
 `--dir <install dir>`. Env passthrough: `PI_API_BASE` (default `https://ai.billycloud.my.id/v1`),
 `PI_NO_SERVICE=1` to skip the systemd unit.
 
+## Per-agent tokens (one per host, revocable)
+
+The master `PI_HUB_TOKEN` still works, but a host should get its **own** token: the token *is*
+the agent's identity, so a client can never claim another agent's name, and one leaked host
+does not compromise the rest.
+
+```bash
+cd ~/pi-hub
+node agents.mjs add rumah --root /home/billy/work   # prints token + install command
+node agents.mjs list
+node agents.mjs revoke rumah                        # 401 at once, socket dropped within 30 s
+```
+
+State: `~/.pi-hub/agents.json` (chmod 600).
+
 ## API
 
 ```bash
 # health (public)
 curl https://pi.billycloud.my.id/health
 
-# connected hosts
-curl -H "Authorization: Bearer $PI_HUB_TOKEN" https://pi.billycloud.my.id/hosts
+# connected hosts (live sockets)
+curl -H "Authorization: Bearer ***" https://pi.billycloud.my.id/hosts
+
+# registry (persisted, online flag)
+curl -H "Authorization: Bearer ***" https://pi.billycloud.my.id/agents
 
 # run a prompt on one host
 curl -X POST https://pi.billycloud.my.id/run \
-  -H "Authorization: Bearer $PI_HUB_TOKEN" -H 'content-type: application/json' \
+  -H "Authorization: Bearer ***" -H 'content-type: application/json' \
   -d '{"host":"rumah","message":"list files in this dir","cwd":".","timeoutMs":120000}'
+
+# verify with a plain shell command (same allowed root, no agent in the loop)
+curl -X POST https://pi.billycloud.my.id/exec \
+  -H "Authorization: Bearer ***" -H 'content-type: application/json' \
+  -d '{"host":"rumah","command":"git status --short && npm test","cwd":"app","timeoutMs":120000}'
 ```
 
-Response: `{"type":"result","ok":true,"text":"…","toolCalls":N,"durationMs":N,"cwd":"…"}`.
+Response `run`: `{"type":"result","ok":true,"text":"…","toolCalls":N,"durationMs":N,"cwd":"…"}`.
+Response `exec`: `{"type":"result","ok":true,"stdout":"…","stderr":"…","exitCode":N,"timedOut":false,"cwd":"…"}`.
+
+With a per-agent token, omit `host`: the token pins the request to its own agent, and `host`
+in the body is ignored. One run per agent at a time — a second request while busy fails with
+`agent busy with another run`.
 
 ## Gotchas (learned the hard way)
 

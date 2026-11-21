@@ -113,6 +113,7 @@ cfg.providers = cfg.providers || {};
 
 (async () => {
   const ids = new Set([modelId]);
+  const meta = new Map(); // id -> { contextWindow, maxTokens, input }
   try {
     const res = await fetch(apiBase + '/models', {
       headers: { authorization: 'Bearer ' + key },
@@ -122,7 +123,16 @@ cfg.providers = cfg.providers || {};
     for (const m of data.data || []) {
       const id = typeof m === 'string' ? m : m.id;
       // Only flat ids belong to the named provider (skip 'kc/anthropic/…').
-      if (id && !id.includes('/')) ids.add(id);
+      if (!id || id.includes('/')) continue;
+      ids.add(id);
+      if (typeof m === 'string') continue;
+      const cap = m.capabilities || {};
+      // 9router reports real limits at the top level; fall back to capabilities.
+      meta.set(id, {
+        contextWindow: m.context_length || cap.contextWindow,
+        maxTokens: m.max_completion_tokens || cap.maxOutput,
+        input: cap.vision === false ? ['text'] : ['text', 'image'],
+      });
     }
   } catch (err) {
     console.error('warn: could not list models from ' + apiBase + ' (' + err.message + '); using ' + modelId);
@@ -133,12 +143,17 @@ cfg.providers = cfg.providers || {};
     api: 'openai-completions',
     apiKey: key,
     compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
-    models: [...ids].map((id) => ({
-      id,
-      name: id.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
-      contextWindow: 200000,
-      maxTokens: 16384,
-    })),
+    models: [...ids].map((id) => {
+      const m = meta.get(id) || {};
+      return {
+        id,
+        name: id.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
+        contextWindow: m.contextWindow || 200000,
+        maxTokens: m.maxTokens || 16384,
+        // Omit this and Pi treats the model as text-only and drops image blocks.
+        input: m.input || ['text', 'image'],
+      };
+    }),
   };
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });

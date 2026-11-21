@@ -52,6 +52,7 @@ function connect() {
           arch: process.arch,
           root: ROOT,
           model: DEFAULT_MODEL || null,
+          capabilities: ['run', 'exec'],
         },
       }),
     );
@@ -65,6 +66,7 @@ function connect() {
       return;
     }
     if (msg.type === 'run') void handleRun(msg);
+    if (msg.type === 'exec') void handleExec(msg);
     if (msg.type === 'cancel') {
       if (active && (!msg.id || msg.id === active.runId)) {
         active.proc.stdin?.write(JSON.stringify({ type: 'abort' }) + '\n');
@@ -192,6 +194,64 @@ function runPi({ runId, cwd, message, model, sessionId, name, timeoutMs }) {
 
 function pushProgress(p) {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'progress', ...p }));
+}
+
+// Verification verb: a plain shell command under the same allowed root. Amanda uses this to
+// check the agent's work (git diff, tests, build) instead of trusting the run's own report.
+function runShell({ command, cwd, timeoutMs }) {
+  return new Promise((resolve, reject) => {
+    const realCwd = cwd ? path.resolve(ROOT, cwd) : ROOT;
+    if (!realCwd.startsWith(path.resolve(ROOT))) {
+      return reject(new Error(`cwd outside allowed root: ${realCwd}`));
+    }
+    const proc = spawn('/bin/bash', ['-lc', command], { cwd: realCwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const cap = (buf, chunk) => (buf + chunk).slice(-65_536);
+    const finish = (exitCode, timedOut) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ stdout, stderr, exitCode, timedOut, cwd: realCwd });
+    };
+    const timer = setTimeout(() => {
+      try {
+        proc.kill('SIGKILL');
+      } catch {}
+      finish(null, true);
+    }, timeoutMs);
+    proc.stdout.on('data', (d) => (stdout = cap(stdout, d.toString())));
+    proc.stderr.on('data', (d) => (stderr = cap(stderr, d.toString())));
+    proc.on('error', (e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(`failed to run command: ${e.message}`));
+    });
+    proc.on('exit', (code) => finish(code, false));
+  });
+}
+
+async function handleExec(msg) {
+  if (busy) {
+    ws.send(JSON.stringify({ type: 'result', id: msg.id, ok: false, error: 'agent busy with another run' }));
+    return;
+  }
+  busy = true;
+  const started = Date.now();
+  log(`[exec ${msg.id}] cwd=${msg.cwd || ROOT}`);
+  try {
+    const timeoutMs = Math.min(Number(msg.timeoutMs) || 120_000, 1_800_000);
+    const result = await runShell({ ...msg, timeoutMs });
+    log(`[exec ${msg.id}] exit=${result.exitCode} in ${Date.now() - started}ms`);
+    ws.send(JSON.stringify({ type: 'result', id: msg.id, ok: true, ...result, durationMs: Date.now() - started }));
+  } catch (e) {
+    log(`[exec ${msg.id}] error: ${e.message}`);
+    ws.send(JSON.stringify({ type: 'result', id: msg.id, ok: false, error: e.message }));
+  } finally {
+    busy = false;
+  }
 }
 
 async function handleRun(msg) {

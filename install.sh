@@ -210,7 +210,10 @@ UNIT
 
   loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
   systemctl --user daemon-reload
-  if ! systemctl --user enable --now pi-hub-agent.service; then
+  # `enable --now` is a no-op on an already-running unit: a re-install with a new
+  # name/token would leave the old process (old env) in place. Restart unconditionally.
+  systemctl --user enable pi-hub-agent.service >/dev/null 2>&1 || true
+  if ! systemctl --user restart pi-hub-agent.service; then
     die "could not start pi-hub-agent.service (see: systemctl --user status pi-hub-agent)"
   fi
 elif [ "${PI_NO_SERVICE:-0}" = "1" ]; then

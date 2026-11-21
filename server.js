@@ -2,10 +2,10 @@
 // the hub forwards it over an already-open outbound WebSocket to the pi agent
 // sitting on Billy's home/office host. No inbound port on those hosts.
 import http from 'node:http';
-import { readFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 
 const PORT = Number(process.env.PI_HUB_PORT || 8742);
@@ -19,6 +19,7 @@ if (!TOKEN) {
 // Per-agent tokens: a token *is* the agent's identity, so a client can never claim another
 // agent's name. Managed with `node agents.mjs add|list|revoke <name>`.
 const STATE = process.env.PI_HUB_STATE || path.join(homedir(), '.pi-hub', 'agents.json');
+const PUBLIC_URL = process.env.PI_HUB_PUBLIC || 'https://pi.billycloud.my.id';
 
 function registry() {
   try {
@@ -26,6 +27,17 @@ function registry() {
   } catch {
     return {};
   }
+}
+
+function readState() {
+  const s = registry();
+  return { agents: s };
+}
+
+function writeState(state) {
+  mkdirSync(path.dirname(STATE), { recursive: true });
+  writeFileSync(STATE, JSON.stringify(state, null, 2) + '\n');
+  chmodSync(STATE, 0o600);
 }
 
 function agentByToken(token) {
@@ -148,8 +160,9 @@ const server = http.createServer(async (req, res) => {
     return serveFile(res, pub, pub.endsWith('.json') ? 'application/json' : 'text/plain; charset=utf-8');
   }
 
-  if (!safeEq(req.headers.authorization?.replace(/^Bearer\s+/i, ''), TOKEN)) {
-    const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  req.isMaster = safeEq(bearer, TOKEN);
+  if (!req.isMaster) {
     const pinned = agentByToken(bearer);
     if (!pinned) return json(res, 401, { error: 'unauthorized' });
     // An agent's own token may only act as itself.
@@ -191,8 +204,51 @@ const server = http.createServer(async (req, res) => {
           createdAt: a?.createdAt || null,
           revokedAt: a?.revokedAt || null,
           lastSeenAt: a?.lastSeenAt || null,
+          root: a?.root || null,
         })),
       });
+    }
+
+    // Mint / revoke agent tokens. Master only: an agent must not be able to enroll its siblings.
+    if (req.method === 'POST' && url.pathname === '/agents') {
+      if (!req.isMaster) return json(res, 403, { error: 'master token required' });
+      const body = await readBody(req);
+      const name = String(body.name || '').trim();
+      if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(name)) {
+        return json(res, 400, { error: 'name must be 1-32 chars: a-z, 0-9, dash' });
+      }
+      const state = readState();
+      if (state.agents[name] && !state.agents[name].revokedAt) {
+        return json(res, 409, { error: `agent "${name}" already exists (revoke it first)` });
+      }
+      const token = `pha_${randomBytes(24).toString('base64url')}`;
+      const root = body.root ? String(body.root) : null;
+      state.agents[name] = { token, createdAt: new Date().toISOString(), revokedAt: null, root };
+      writeState(state);
+      const rootArg = root ? ` --root ${root}` : '';
+      return json(res, 201, {
+        name,
+        token, // shown once; only a hash-free registry keeps it, so the caller must store it now
+        install: `curl -fsSL ${PUBLIC_URL}/install.sh | bash -s -- --token ${token} --name ${name}${rootArg}`,
+      });
+    }
+
+    if (req.method === 'DELETE' && url.pathname.startsWith('/agents/')) {
+      if (!req.isMaster) return json(res, 403, { error: 'master token required' });
+      const name = decodeURIComponent(url.pathname.slice('/agents/'.length));
+      const state = readState();
+      const a = state.agents[name];
+      if (!a) return json(res, 404, { error: `unknown agent "${name}"` });
+      a.revokedAt ||= new Date().toISOString();
+      writeState(state);
+      const sock = agents.get(name);
+      if (sock) {
+        agents.delete(name);
+        try {
+          sock.ws.close(4001, 'revoked');
+        } catch {}
+      }
+      return json(res, 200, { ok: true, name });
     }
 
     if (req.method === 'POST' && url.pathname === '/run') {

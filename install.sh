@@ -196,11 +196,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=$HOME/.pi-hub.env
+EnvironmentFile=%h/.pi-hub.env
 WorkingDirectory=$DIR
 ExecStart=$(command -v node) $DIR/agent.js
 Restart=always
 RestartSec=5
+StandardOutput=append:%h/.pi-hub-agent.log
+StandardError=append:%h/.pi-hub-agent.log
 
 [Install]
 WantedBy=default.target

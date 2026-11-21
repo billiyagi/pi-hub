@@ -2,7 +2,10 @@
 # pi-hub agent installer — run this ON the home/office host.
 #
 #   curl -fsSL https://pi.billycloud.my.id/install.sh \
-#     | bash -s -- --token <HUB_TOKEN> --key <PI_BILLY_KEY> --name rumah
+#     | bash -s -- --token <AGENT_TOKEN> --name rumah [--root <dir>]
+#
+# No --key needed: the model config (provider key included) is copied from the hub over the
+# same token-authenticated channel. Pass --key only to override it.
 #
 # Installs the `pi` coding agent plus this agent bridge, then dials OUT to the
 # hub over WebSocket. No inbound port, no public IP, no VPN needed.
@@ -31,7 +34,8 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$TOKEN" ] || { echo "error: --token <HUB_TOKEN> is required (ask Amanda)" >&2; exit 1; }
-[ -n "$KEY" ] || { echo "error: --key <PI_BILLY_KEY> is required (model provider key, ask Amanda). Without it pi starts but every run hangs until timeout." >&2; exit 1; }
+# No --key: pull the hub's own ~/.pi/agent/models.json over the authenticated bootstrap
+# endpoint, so the provider key never appears in a command, shell history or chat.
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -63,7 +67,10 @@ mkdir -p "$DIR"
 
 # Prefer files next to this script (running from a repo checkout); otherwise
 # pull them from the hub, which serves them publicly.
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null || echo .)"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" 2>/dev/null || echo .)"
+# Only trust files next to the script when it is a real path (not `curl | bash`, where
+# BASH_SOURCE is empty and "." would silently copy whatever happens to sit in $PWD).
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then :; else SELF_DIR=/nonexistent; fi
 for f in package.json agent.js; do
   if [ -f "$SELF_DIR/$f" ] && [ "$SELF_DIR" != "$DIR" ]; then
     cp "$SELF_DIR/$f" "$DIR/$f"
@@ -99,6 +106,18 @@ chmod 600 "$HOME/.pi-hub.env"
 say "configuring pi provider (billy) in ~/.pi/agent/models.json"
 mkdir -p "$HOME/.pi/agent"
 PI_API_BASE="${PI_API_BASE:-https://ai.billycloud.my.id/v1}"
+if [ -z "$KEY" ]; then
+  say "no --key: copying model config from the hub (over TLS, token-authenticated)"
+  TMP="$(mktemp)"
+  curl -fsS -H "Authorization: Bearer $TOKEN" "$HTTP_BASE/bootstrap/models.json" -o "$TMP" \
+    || { rm -f "$TMP"; die "could not fetch /bootstrap/models.json — token valid? hub has a model config?"; }
+  chmod 600 "$TMP"
+  mkdir -p "$HOME/.pi/agent"
+  mv "$TMP" "$HOME/.pi/agent/models.json"
+  KEY="$(node -e 'const c=require(process.argv[1]);const p=c.providers[process.argv[2]]||{};process.stdout.write(p.apiKey||"")' "$HOME/.pi/agent/models.json" "${MODEL%%/*}")"
+  [ -n "$KEY" ] || die "hub config has no provider '${MODEL%%/*}'"
+  echo "   provider '${MODEL%%/*}' copied from hub"
+else
 node - "$KEY" "$PI_API_BASE" "$MODEL" <<'NODE'
 const fs = require('fs');
 const path = require('path');
@@ -161,6 +180,7 @@ cfg.providers = cfg.providers || {};
   console.log(`   provider "${providerName}" -> ${apiBase} (${cfg.providers[providerName].models.length} models)`);
 })();
 NODE
+fi
 
 # --- service ------------------------------------------------------------
 if [ "${PI_NO_SERVICE:-0}" != "1" ] \

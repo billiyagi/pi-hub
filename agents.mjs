@@ -49,7 +49,7 @@ if (cmd === 'add') {
   console.log(`token: ${token}`);
   console.log('');
   console.log('install on that host:');
-  console.log(`  curl -fsSL ${HUB}/install.sh | bash -s -- --token ${token} --key <PI_BILLY_KEY> --name ${name}${rootArg}`);
+  console.log(`  curl -fsSL ${HUB}/install.sh | bash -s -- --token ${token} --name ${name}${rootArg}`);
 } else if (cmd === 'list') {
   const rows = Object.entries(state.agents);
   if (!rows.length) console.log('no agents');

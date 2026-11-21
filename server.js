@@ -2,7 +2,7 @@
 // the hub forwards it over an already-open outbound WebSocket to the pi agent
 // sitting on Billy's home/office host. No inbound port on those hosts.
 import http from 'node:http';
-import { readFile, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
@@ -92,16 +92,18 @@ const PUBLIC_FILES = {
 
 function serveFile(res, name, type) {
   const file = new URL(`./${name}`, import.meta.url);
-  readFile(file, 'utf8')
-    .then((text) => {
-      res.writeHead(200, {
-        'content-type': type,
-        'content-length': Buffer.byteLength(text),
-        'cache-control': 'no-cache',
-      });
-      res.end(text);
-    })
-    .catch(() => json(res, 404, { error: 'not found' }));
+  let text;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch {
+    return json(res, 404, { error: 'not found' });
+  }
+  res.writeHead(200, {
+    'content-type': type,
+    'content-length': Buffer.byteLength(text),
+    'cache-control': 'no-cache',
+  });
+  res.end(text);
 }
 
 function listAgents() {
@@ -155,6 +157,27 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    // Model config for a new host. Authenticated on purpose: the file carries the provider
+    // key, so it must never sit in a public bootstrap path nor travel in a shell command.
+    if (req.method === 'GET' && url.pathname === '/bootstrap/models.json') {
+      let cfg;
+      try {
+        cfg = JSON.parse(readFileSync(path.join(homedir(), '.pi', 'agent', 'models.json'), 'utf8'));
+      } catch {
+        return json(res, 404, { error: 'hub has no ~/.pi/agent/models.json' });
+      }
+      // The hub's own file may hold a placeholder like "$PI_BILLY_KEY"; hand out the resolved
+      // value so the new host never needs the key in a command line.
+      for (const p of Object.values(cfg.providers || {})) {
+        if (typeof p.apiKey === 'string' && p.apiKey.startsWith('$')) {
+          const name = p.apiKey.replace(/^\$\{?|\}$/g, '');
+          if (process.env[name]) p.apiKey = process.env[name];
+        }
+      }
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      return res.end(JSON.stringify(cfg));
+    }
+
     if (req.method === 'GET' && url.pathname === '/hosts') {
       return json(res, 200, { hosts: listAgents() });
     }

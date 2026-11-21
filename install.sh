@@ -208,9 +208,9 @@ UNIT
 
   loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
   systemctl --user daemon-reload
-  systemctl --user enable --now pi-hub-agent.service
-  sleep 2
-  systemctl --user --no-pager --lines=0 status pi-hub-agent.service 2>/dev/null || true
+  if ! systemctl --user enable --now pi-hub-agent.service; then
+    die "could not start pi-hub-agent.service (see: systemctl --user status pi-hub-agent)"
+  fi
 elif [ "${PI_NO_SERVICE:-0}" = "1" ]; then
   say "service install skipped (PI_NO_SERVICE=1)"
 else
@@ -218,9 +218,30 @@ else
   mkdir -p "$HOME/.pi-hub"
   set -a; . "$HOME/.pi-hub.env"; set +a
   nohup node "$DIR/agent.js" >> "$HOME/.pi-hub/agent.out" 2>&1 &
-  sleep 4
-  tail -5 "$HOME/.pi-hub/agent.out" 2>/dev/null || true
 fi
 
-say "done. host \"$NAME\" should now be online:"
-say "  curl -H 'Authorization: Bearer <token>' ${HTTP_BASE}/hosts"
+# --- verify -------------------------------------------------------------
+# "done" without proof is how a host stays silently offline: the service can fail to
+# start and the operator only sees a green script. Poll the hub until this name shows up.
+online() {
+  curl -fsS -H "Authorization: Bearer $TOKEN" "$HTTP_BASE/hosts" 2>/dev/null \
+    | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const h=JSON.parse(s).hosts||[];process.exit(h.some(x=>x.name===process.argv[1])?0:1)}catch{process.exit(1)}})' "$NAME"
+}
+say "waiting for \"$NAME\" to dial in"
+for _ in $(seq 1 15); do online && break; sleep 2; done
+
+if ! online; then
+  printf '\033[1;31merror:\033[0m host "%s" did not connect. Log:\n' "$NAME" >&2
+  if [ "${PI_NO_SERVICE:-0}" = "1" ]; then
+    echo "  (service skipped — start it yourself: node $DIR/agent.js)" >&2
+  elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+    systemctl --user --no-pager --lines=15 status pi-hub-agent.service >&2 2>&1 || true
+    journalctl --user -u pi-hub-agent -n 15 --no-pager >&2 2>&1 || true
+  else
+    tail -15 "$HOME/.pi-hub/agent.out" >&2 2>/dev/null || true
+  fi
+  exit 1
+fi
+
+say "host \"$NAME\" is online."
+say "  Workspace -> Agents: Run/Shell are now enabled for it."
